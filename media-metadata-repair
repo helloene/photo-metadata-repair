@@ -1,0 +1,1254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  media-metadata-repair [options] <folder-or-file>...
+
+Options:
+  --tz +08:00                 Timezone offset to write into EXIF/XMP offset tags.
+  --gps LAT,LON               Write GPS coordinates to EXIF and XMP GPS fields.
+  --set-time DATETIME         Set capture time for all inputs, then sync supported time fields.
+  --set-gps LAT,LON           Set GPS coordinates for all inputs.
+  --set-make MAKE             Set camera/device make for all inputs.
+  --set-model MODEL           Set camera/device model for all inputs.
+  --metadata-csv FILE         Set per-file metadata from CSV columns: file,time,gps,make,model.
+  --dry-run                   Print actions without modifying files.
+  --output-dir DIR            Write repaired copies under DIR. Default: ./media-metadata-repair-output-YYYYMMDD-HHMMSS
+  --in-place                  Modify input files directly instead of working on repaired copies.
+  --from-filename-if-missing  Fill missing embedded capture time from recognizable filename timestamps, after grouped sample confirmation.
+  --yes                       Skip interactive confirmation for filename-derived timestamps.
+  --convert-jpg-to-jxl        Losslessly transcode .jpg/.jpeg files to .jxl files after metadata repair.
+  --overwrite-jxl             Overwrite existing .jxl files when converting JPEG to JPEG XL.
+  --replace-jpg-with-jxl      After successful JPEG XL conversion, remove the corresponding .jpg/.jpeg file.
+  --repair-mislabelled-heic   For .heic files that are actually JPEG bytes, write via a temporary JPEG copy and restore the original filename.
+  --verify-sample N           Print metadata for N random files after repair.
+
+What it does:
+  - Images: choose DateTimeOriginal, then fallback to CreateDate/ModifyDate/file dates, and sync EXIF/TIFF/XMP/IPTC/file time fields.
+  - Videos: choose QuickTime CreateDate, then fallback to MediaCreateDate/TrackCreateDate/file dates, and sync QuickTime/file time fields.
+  - Device metadata: sync existing Make/Model across supported EXIF/TIFF/XMP/QuickTime fields.
+  - Optional manual metadata: set global or per-file time/GPS/make/model.
+  - By default: copy supported files to an output directory and repair those copies.
+  - Optional JPEG XL: losslessly transcode repaired JPEG files to .jxl.
+  - Optional filename recovery: write missing embedded capture time from unambiguous filename timestamps.
+  - Optional GPS: write latitude/longitude to EXIF GPS and XMP-exif GPS fields.
+  - Optional timezone: write OffsetTime/OffsetTimeOriginal/OffsetTimeDigitized.
+USAGE
+}
+
+tz="+08:00"
+gps=""
+set_time=""
+set_gps=""
+set_make=""
+set_model=""
+metadata_csv=""
+dry_run=0
+output_dir=""
+in_place=0
+from_filename_if_missing=0
+assume_yes=0
+convert_jpg_to_jxl=0
+overwrite_jxl=0
+replace_jpg_with_jxl=0
+repair_mislabelled_heic=0
+verify_sample=0
+paths=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tz)
+      tz="${2:?missing timezone value}"
+      shift 2
+      ;;
+    --gps)
+      gps="${2:?missing GPS value LAT,LON}"
+      shift 2
+      ;;
+    --set-time)
+      set_time="${2:?missing time value}"
+      shift 2
+      ;;
+    --set-gps)
+      set_gps="${2:?missing GPS value LAT,LON}"
+      gps="$set_gps"
+      shift 2
+      ;;
+    --set-make)
+      set_make="${2:?missing make value}"
+      shift 2
+      ;;
+    --set-model)
+      set_model="${2:?missing model value}"
+      shift 2
+      ;;
+    --metadata-csv)
+      metadata_csv="${2:?missing metadata CSV file}"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --output-dir)
+      output_dir="${2:?missing output directory}"
+      shift 2
+      ;;
+    --in-place)
+      in_place=1
+      shift
+      ;;
+    --from-filename-if-missing)
+      from_filename_if_missing=1
+      shift
+      ;;
+    --yes|-y)
+      assume_yes=1
+      shift
+      ;;
+    --convert-jpg-to-jxl|--jpg-to-jxl)
+      convert_jpg_to_jxl=1
+      shift
+      ;;
+    --overwrite-jxl)
+      overwrite_jxl=1
+      shift
+      ;;
+    --replace-jpg-with-jxl)
+      replace_jpg_with_jxl=1
+      shift
+      ;;
+    --repair-mislabelled-heic)
+      repair_mislabelled_heic=1
+      shift
+      ;;
+    --verify-sample)
+      verify_sample="${2:?missing sample count}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#paths[@]} -eq 0 ]]; then
+  usage
+  exit 2
+fi
+
+if [[ "$replace_jpg_with_jxl" -eq 1 && "$convert_jpg_to_jxl" -eq 0 ]]; then
+  echo "--replace-jpg-with-jxl requires --convert-jpg-to-jxl" >&2
+  exit 2
+fi
+
+if [[ -n "$metadata_csv" && ! -f "$metadata_csv" ]]; then
+  echo "Metadata CSV not found: $metadata_csv" >&2
+  exit 1
+fi
+
+if [[ "$in_place" -eq 0 && -z "$output_dir" ]]; then
+  output_dir="media-metadata-repair-output-$(date +%Y%m%d-%H%M%S)"
+fi
+
+if ! command -v exiftool >/dev/null 2>&1; then
+  echo "exiftool is required. Install ExifTool with your platform's package manager or official installer." >&2
+  exit 1
+fi
+
+if [[ "$convert_jpg_to_jxl" -eq 1 ]] && ! command -v cjxl >/dev/null 2>&1; then
+  echo "cjxl is required for JPEG XL conversion. Install JPEG XL tools with your platform's package manager." >&2
+  exit 1
+fi
+
+run() {
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf 'DRY RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+run_optional_match() {
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf 'DRY RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@" || true
+  fi
+}
+
+if [[ "$in_place" -eq 0 ]]; then
+  prepared_paths_file="$(mktemp)"
+  ruby - "$dry_run" "$output_dir" "${paths[@]}" > "$prepared_paths_file" <<'RUBY'
+require "fileutils"
+require "find"
+require "pathname"
+require "shellwords"
+
+dry_run, output_root, *input_paths = ARGV
+dry_run = dry_run == "1"
+output_root = File.expand_path(output_root)
+media_exts = %w[.jpg .jpeg .heic .png .tif .tiff .mp4 .mov .m4v .3gp]
+
+def media_file?(path, media_exts)
+  File.file?(path) && media_exts.include?(File.extname(path).downcase)
+end
+
+def unique_destination(path)
+  return path unless File.exist?(path)
+
+  ext = File.extname(path)
+  base = File.join(File.dirname(path), File.basename(path, ext))
+  index = 2
+  loop do
+    candidate = "#{base}-#{index}#{ext}"
+    return candidate unless File.exist?(candidate)
+    index += 1
+  end
+end
+
+def unique_planned_destination(path, used_destinations)
+  candidate = unique_destination(path)
+  return used_destinations[candidate] = candidate unless used_destinations.key?(candidate)
+
+  ext = File.extname(path)
+  base = File.join(File.dirname(path), File.basename(path, ext))
+  index = 2
+  loop do
+    candidate = unique_destination("#{base}-#{index}#{ext}")
+    return used_destinations[candidate] = candidate unless used_destinations.key?(candidate)
+    index += 1
+  end
+end
+
+def unique_key_for_input(expanded, used_keys)
+  basename = File.basename(expanded)
+  parent = File.basename(File.dirname(expanded))
+  candidates = [
+    basename,
+    parent.empty? ? basename : "#{parent}-#{basename}",
+    expanded.sub(%r{\A/+}, "").tr("/", "-")
+  ]
+
+  candidates.each do |candidate|
+    next if candidate.empty?
+    next if used_keys.key?(candidate)
+    used_keys[candidate] = true
+    return candidate
+  end
+
+  index = 2
+  loop do
+    candidate = "#{basename}-#{index}"
+    next index += 1 if used_keys.key?(candidate)
+    used_keys[candidate] = true
+    return candidate
+  end
+end
+
+prepared_roots = []
+used_root_keys = {}
+used_destinations = {}
+
+input_paths.each do |input_path|
+  expanded = File.expand_path(input_path)
+
+  if File.directory?(expanded)
+    output_root_for_input = File.join(output_root, unique_key_for_input(expanded, used_root_keys))
+    prepared_roots << output_root_for_input
+    Find.find(expanded) do |source|
+      if File.directory?(source)
+        Find.prune if File.expand_path(source) == output_root
+        next
+      end
+      next unless media_file?(source, media_exts)
+
+      relative = Pathname.new(source).relative_path_from(Pathname.new(expanded)).to_s
+      destination = File.join(output_root_for_input, relative)
+      if dry_run
+        warn "DRY RUN: copy #{source.shellescape} -> #{destination.shellescape}"
+      else
+        FileUtils.mkdir_p(File.dirname(destination))
+        FileUtils.cp(source, destination, preserve: true)
+      end
+    end
+  elsif media_file?(expanded, media_exts)
+    destination = unique_planned_destination(File.join(output_root, File.basename(expanded)), used_destinations)
+    prepared_roots << destination
+    if dry_run
+      warn "DRY RUN: copy #{expanded.shellescape} -> #{destination.shellescape}"
+    else
+      FileUtils.mkdir_p(File.dirname(destination))
+      FileUtils.cp(expanded, destination, preserve: true)
+    end
+  else
+    warn "Skipping unsupported input #{input_path}"
+  end
+end
+
+prepared_roots.uniq.each { |path| puts path }
+RUBY
+
+  prepared_paths=()
+  while IFS= read -r prepared_path; do
+    [[ -n "$prepared_path" ]] && prepared_paths+=("$prepared_path")
+  done < "$prepared_paths_file"
+  rm -f "$prepared_paths_file"
+
+  if [[ ${#prepared_paths[@]} -eq 0 ]]; then
+    echo "No supported media files found to prepare." >&2
+    exit 1
+  fi
+
+  if [[ "$dry_run" -eq 0 ]]; then
+    echo "Prepared repaired-copy workspace: $output_dir"
+  else
+    echo "Dry run: would prepare repaired-copy workspace: $output_dir"
+  fi
+  paths=("${prepared_paths[@]}")
+fi
+
+image_gps_args=()
+video_gps_args=()
+if [[ -n "$gps" ]]; then
+  lat="${gps%,*}"
+  lon="${gps#*,}"
+  lat_ref="N"
+  lon_ref="E"
+  [[ "$lat" == -* ]] && lat_ref="S"
+  [[ "$lon" == -* ]] && lon_ref="W"
+  image_gps_args=(
+    "-GPSLatitude=$lat"
+    "-GPSLongitude=$lon"
+    "-GPSLatitudeRef=$lat_ref"
+    "-GPSLongitudeRef=$lon_ref"
+    "-XMP-exif:GPSLatitude=$lat"
+    "-XMP-exif:GPSLongitude=$lon"
+  )
+  video_gps_args=(
+    "-Keys:GPSCoordinates=$lat, $lon"
+    "-UserData:GPSCoordinates=$lat, $lon"
+  )
+fi
+
+common_exts=(-ext jpg -ext jpeg -ext heic -ext png -ext tif -ext tiff -ext mp4 -ext mov -ext m4v -ext 3gp)
+image_exts=(-ext jpg -ext jpeg -ext heic -ext png -ext tif -ext tiff)
+video_exts=(-ext mp4 -ext mov -ext m4v -ext 3gp)
+if [[ "$repair_mislabelled_heic" -eq 1 ]]; then
+  image_exts=(-ext jpg -ext jpeg -ext png -ext tif -ext tiff)
+fi
+
+has_image_targets() {
+  if [[ "$repair_mislabelled_heic" -eq 1 ]]; then
+    find "${paths[@]}" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.tif' -o -iname '*.tiff' \) -print -quit 2>/dev/null | grep -q .
+  else
+    find "${paths[@]}" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' -o -iname '*.png' -o -iname '*.tif' -o -iname '*.tiff' \) -print -quit 2>/dev/null | grep -q .
+  fi
+}
+
+has_video_targets() {
+  find "${paths[@]}" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.3gp' \) -print -quit 2>/dev/null | grep -q .
+}
+
+if [[ "$repair_mislabelled_heic" -eq 1 ]]; then
+  echo "Repairing mislabelled HEIC files that are JPEG data..."
+  if [[ "$dry_run" -eq 1 ]]; then
+    find "${paths[@]}" -type f -iname '*.heic' -print 2>/dev/null \
+      | while IFS= read -r file; do
+          if file "$file" | grep -qi 'jpeg'; then
+            printf 'DRY RUN: repair JPEG data in HEIC path %q via temporary .jpg\n' "$file"
+          fi
+        done
+  else
+    find "${paths[@]}" -type f -iname '*.heic' -print 2>/dev/null \
+      | while IFS= read -r file; do
+          [[ -f "$file" ]] || continue
+          if file "$file" | grep -qi 'jpeg'; then
+            tmp="${file%/*}/.$(basename "$file").tmp.jpg"
+            cp "$file" "$tmp"
+            exiftool -P -overwrite_original -m \
+              "-DateTimeOriginal<DateTimeOriginal" \
+              "-CreateDate<DateTimeOriginal" \
+              "-ModifyDate<DateTimeOriginal" \
+              "-XMP:DateCreated<DateTimeOriginal" \
+              "-XMP:CreateDate<DateTimeOriginal" \
+              "-XMP-photoshop:DateCreated<DateTimeOriginal" \
+              "-IPTC:DateCreated<DateTimeOriginal" \
+              "-IPTC:TimeCreated<DateTimeOriginal" \
+              "-OffsetTime=$tz" \
+              "-OffsetTimeOriginal=$tz" \
+              "-OffsetTimeDigitized=$tz" \
+              "-FileModifyDate<DateTimeOriginal" \
+              "-FileCreateDate<DateTimeOriginal" \
+              "${image_gps_args[@]}" \
+              "$tmp" >/dev/null && mv "$tmp" "$file" || rm -f "$tmp"
+          fi
+        done
+  fi
+fi
+
+if [[ "$from_filename_if_missing" -eq 1 ]]; then
+  ruby - "$tz" "$dry_run" "$assume_yes" "${paths[@]}" <<'RUBY'
+require "csv"
+require "open3"
+
+tz, dry_run, assume_yes, *paths = ARGV
+dry_run = dry_run == "1"
+assume_yes = assume_yes == "1"
+
+EXT_ARGS = %w[-ext jpg -ext jpeg -ext heic -ext png -ext tif -ext tiff -ext mp4 -ext mov -ext m4v -ext 3gp].freeze
+IMAGE_EXTS = %w[.jpg .jpeg .heic .png .tif .tiff].freeze
+VIDEO_EXTS = %w[.mp4 .mov .m4v .3gp].freeze
+
+def valid_datetime?(year, month, day, hour, minute, second)
+  year = year.to_i
+  month = month.to_i
+  day = day.to_i
+  hour = hour.to_i
+  minute = minute.to_i
+  second = second.to_i
+  return false unless year.between?(1970, 2099)
+  return false unless hour.between?(0, 23) && minute.between?(0, 59) && second.between?(0, 59)
+
+  Time.new(year, month, day, hour, minute, second)
+  true
+rescue ArgumentError
+  false
+end
+
+def exif_datetime(year, month, day, hour, minute, second)
+  format("%04d:%02d:%02d %02d:%02d:%02d", year.to_i, month.to_i, day.to_i, hour.to_i, minute.to_i, second.to_i)
+end
+
+def iptc_date(datetime)
+  datetime[0, 10].delete(":")
+end
+
+def iptc_time(datetime)
+  datetime[11, 8]
+end
+
+def parse_filename_time(filename)
+  stem = File.basename(filename, File.extname(filename))
+  candidates = []
+
+  patterns = [
+    [
+      "YYYYMMDDHHMMSS",
+      /(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])([01]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)/,
+      "compact 14-digit timestamp"
+    ],
+    [
+      "YYYYMMDD_HHMMSS",
+      /(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[\s_.-]+([01]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)/,
+      "8-digit date plus 6-digit time"
+    ],
+    [
+      "YYYY-MM-DD_HH-MM-SS",
+      /(?<!\d)((?:19|20)\d{2})[-_.](0[1-9]|1[0-2])[-_.](0[1-9]|[12]\d|3[01])(?:[T\s_.-]+)([01]\d|2[0-3])[-_.:]?([0-5]\d)[-_.:]?([0-5]\d)(?!\d)/,
+      "separated date and time"
+    ]
+  ]
+
+  patterns.each do |rule, regexp, description|
+    stem.scan(regexp) do |year, month, day, hour, minute, second|
+      next unless valid_datetime?(year, month, day, hour, minute, second)
+      candidates << {
+        rule: rule,
+        description: description,
+        datetime: exif_datetime(year, month, day, hour, minute, second)
+      }
+    end
+  end
+
+  candidates.uniq { |candidate| [candidate[:rule], candidate[:datetime]] }
+end
+
+def concrete_time?(value)
+  value && !value.strip.empty? && value !~ /^0{4}:0{2}:0{2}/
+end
+
+cmd = [
+  "exiftool",
+  "-r",
+  "-csv",
+  *EXT_ARGS,
+  "-FileName",
+  "-Directory",
+  "-DateTimeOriginal",
+  "-CreateDate",
+  "-ModifyDate",
+  "-QuickTime:CreateDate",
+  "-QuickTime:MediaCreateDate",
+  "-QuickTime:TrackCreateDate",
+  *paths
+]
+
+stdout, stderr, status = Open3.capture3(*cmd)
+unless status.success?
+  warn stderr
+  exit status.exitstatus || 1
+end
+
+rows = CSV.parse(stdout, headers: true)
+proposals = []
+skipped_existing = 0
+skipped_unmatched = 0
+skipped_ambiguous = 0
+
+rows.each do |row|
+  source = row["SourceFile"]
+  next unless source && File.file?(source)
+
+  ext = File.extname(source).downcase
+  media_type =
+    if IMAGE_EXTS.include?(ext)
+      :image
+    elsif VIDEO_EXTS.include?(ext)
+      :video
+    end
+  next unless media_type
+
+  embedded_fields =
+    if media_type == :image
+      [row["DateTimeOriginal"], row["CreateDate"], row["ModifyDate"]]
+    else
+      [row["CreateDate"], row["MediaCreateDate"], row["TrackCreateDate"]]
+    end
+
+  if embedded_fields.any? { |value| concrete_time?(value) }
+    skipped_existing += 1
+    next
+  end
+
+  candidates = parse_filename_time(row["FileName"] || File.basename(source))
+  if candidates.empty?
+    skipped_unmatched += 1
+    next
+  end
+
+  datetimes = candidates.map { |candidate| candidate[:datetime] }.uniq
+  rules = candidates.map { |candidate| candidate[:rule] }.uniq
+  if datetimes.length != 1 || rules.length != 1
+    skipped_ambiguous += 1
+    next
+  end
+
+  candidate = candidates.first
+  proposals << {
+    file: source,
+    media_type: media_type,
+    rule: candidate[:rule],
+    description: candidate[:description],
+    datetime: candidate[:datetime]
+  }
+end
+
+if proposals.empty?
+  puts "No missing embedded capture times could be filled from supported filename timestamp rules."
+  puts "Skipped: #{skipped_existing} already had embedded time, #{skipped_unmatched} had no supported filename time, #{skipped_ambiguous} were ambiguous."
+  exit 0
+end
+
+groups = proposals.group_by { |proposal| proposal[:rule] }
+puts "Filename timestamp preflight:"
+puts "  Proposed writes: #{proposals.length}"
+puts "  Rules found: #{groups.length}"
+puts "  Skipped: #{skipped_existing} already had embedded time, #{skipped_unmatched} had no supported filename time, #{skipped_ambiguous} were ambiguous."
+puts
+
+groups.sort_by { |rule, _items| rule }.each do |rule, items|
+  sample = items.sample
+  puts "- #{rule} (#{sample[:description]}): #{items.length} file(s)"
+  puts "  sample: #{File.basename(sample[:file])} -> #{sample[:datetime]}"
+end
+puts
+
+if dry_run
+  puts "Dry run only: filename-derived timestamps were not written."
+  exit 0
+end
+
+unless assume_yes
+  print "Write these filename-derived timestamps? Type yes to continue: "
+  answer = STDIN.gets&.strip
+  unless answer == "yes"
+    puts "Aborted before writing filename-derived timestamps."
+    exit 2
+  end
+end
+
+proposals.each do |proposal|
+  datetime = proposal[:datetime]
+  args = [
+    "exiftool",
+    "-P",
+    "-overwrite_original",
+    "-m",
+    "-api",
+    "QuickTimeUTC=1"
+  ]
+
+  if proposal[:media_type] == :image
+    args += [
+      "-DateTimeOriginal=#{datetime}",
+      "-CreateDate=#{datetime}",
+      "-ModifyDate=#{datetime}",
+      "-XMP:DateCreated=#{datetime}",
+      "-XMP:CreateDate=#{datetime}",
+      "-XMP-photoshop:DateCreated=#{datetime}",
+      "-IPTC:DateCreated=#{iptc_date(datetime)}",
+      "-IPTC:TimeCreated=#{iptc_time(datetime)}",
+      "-OffsetTime=#{tz}",
+      "-OffsetTimeOriginal=#{tz}",
+      "-OffsetTimeDigitized=#{tz}",
+      "-FileModifyDate=#{datetime}",
+      "-FileCreateDate=#{datetime}"
+    ]
+  else
+    args += [
+      "-QuickTime:CreateDate=#{datetime}",
+      "-QuickTime:MediaCreateDate=#{datetime}",
+      "-QuickTime:TrackCreateDate=#{datetime}",
+      "-FileModifyDate=#{datetime}",
+      "-FileCreateDate=#{datetime}"
+    ]
+  end
+
+  args << proposal[:file]
+  system(*args, out: File::NULL) || exit($?.exitstatus || 1)
+end
+
+puts "Wrote filename-derived timestamps to #{proposals.length} file(s)."
+RUBY
+fi
+
+if [[ -n "$set_time" || -n "$set_gps" || -n "$set_make" || -n "$set_model" || -n "$metadata_csv" ]]; then
+  echo "Applying manual metadata..."
+  ruby - "$dry_run" "$tz" "$set_time" "$set_gps" "$set_make" "$set_model" "$metadata_csv" "${paths[@]}" <<'RUBY'
+require "csv"
+require "find"
+require "shellwords"
+
+dry_run, tz, global_time, global_gps, global_make, global_model, metadata_csv, *paths = ARGV
+dry_run = dry_run == "1"
+image_exts = %w[.jpg .jpeg .heic .png .tif .tiff]
+video_exts = %w[.mp4 .mov .m4v .3gp]
+media_exts = image_exts + video_exts
+
+def media_file?(path, media_exts)
+  File.file?(path) && media_exts.include?(File.extname(path).downcase)
+end
+
+def collect_targets(paths, media_exts)
+  paths.flat_map do |path|
+    expanded = File.expand_path(path)
+    if File.directory?(expanded)
+      found = []
+      Find.find(expanded) { |item| found << item if media_file?(item, media_exts) }
+      found
+    elsif media_file?(expanded, media_exts)
+      [expanded]
+    else
+      []
+    end
+  end.uniq
+end
+
+def normalize_time(value)
+  return nil if value.nil? || value.strip.empty?
+
+  text = value.strip
+  if text =~ /\A(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\z/
+    return "#{$1}:#{$2}:#{$3} #{$4}:#{$5}:#{$6}"
+  end
+  if text =~ /\A(\d{4})[-:](\d{2})[-:](\d{2})[ T_](\d{2}):?(\d{2}):?(\d{2})/
+    return "#{$1}:#{$2}:#{$3} #{$4}:#{$5}:#{$6}"
+  end
+  text
+end
+
+def iptc_date(datetime)
+  datetime[0, 10].delete(":")
+end
+
+def iptc_time(datetime)
+  datetime[11, 8]
+end
+
+def parse_gps(value, lat_value = nil, lon_value = nil)
+  if value && !value.strip.empty?
+    parts = value.strip.split(/\s*,\s*/)
+    return [parts[0], parts[1]] if parts.length >= 2 && !parts[0].empty? && !parts[1].empty?
+  end
+  return [lat_value.strip, lon_value.strip] if lat_value && lon_value && !lat_value.strip.empty? && !lon_value.strip.empty?
+
+  nil
+end
+
+def row_value(row, *names)
+  names.each do |name|
+    value = row[name]
+    return value if value && !value.strip.empty?
+  end
+  nil
+end
+
+def resolve_target(key, targets)
+  return nil if key.nil? || key.strip.empty?
+
+  normalized = key.strip.tr("\\", "/")
+  expanded = File.expand_path(normalized)
+  exact = targets.select { |target| target == expanded || target.tr("\\", "/") == normalized }
+  return exact.first if exact.length == 1
+
+  suffix_matches = targets.select { |target| target.tr("\\", "/").end_with?("/#{normalized}") }
+  return suffix_matches.first if suffix_matches.length == 1
+
+  basename_matches = targets.select { |target| File.basename(target) == File.basename(normalized) }
+  return basename_matches.first if basename_matches.length == 1
+
+  warn "Could not uniquely match CSV file '#{key}'"
+  nil
+end
+
+def metadata_args_for(file, metadata, image_exts, video_exts, tz)
+  ext = File.extname(file).downcase
+  datetime = normalize_time(metadata[:time])
+  gps = parse_gps(metadata[:gps], metadata[:lat], metadata[:lon])
+  make = metadata[:make]
+  model = metadata[:model]
+  args = ["exiftool", "-P", "-overwrite_original", "-m", "-api", "QuickTimeUTC=1"]
+
+  if image_exts.include?(ext)
+    if datetime
+      args += [
+        "-DateTimeOriginal=#{datetime}",
+        "-CreateDate=#{datetime}",
+        "-ModifyDate=#{datetime}",
+        "-XMP:DateCreated=#{datetime}",
+        "-XMP:CreateDate=#{datetime}",
+        "-XMP-photoshop:DateCreated=#{datetime}",
+        "-IPTC:DateCreated=#{iptc_date(datetime)}",
+        "-IPTC:TimeCreated=#{iptc_time(datetime)}",
+        "-OffsetTime=#{tz}",
+        "-OffsetTimeOriginal=#{tz}",
+        "-OffsetTimeDigitized=#{tz}",
+        "-FileModifyDate=#{datetime}",
+        "-FileCreateDate=#{datetime}"
+      ]
+    end
+    if gps
+      lat, lon = gps
+      args += [
+        "-GPSLatitude=#{lat}",
+        "-GPSLongitude=#{lon}",
+        "-GPSLatitudeRef=#{lat.to_s.start_with?("-") ? "S" : "N"}",
+        "-GPSLongitudeRef=#{lon.to_s.start_with?("-") ? "W" : "E"}",
+        "-XMP-exif:GPSLatitude=#{lat}",
+        "-XMP-exif:GPSLongitude=#{lon}"
+      ]
+    end
+    args += ["-IFD0:Make=#{make}", "-XMP-tiff:Make=#{make}"] if make && !make.empty?
+    args += ["-IFD0:Model=#{model}", "-XMP-tiff:Model=#{model}"] if model && !model.empty?
+  elsif video_exts.include?(ext)
+    if datetime
+      args += [
+        "-QuickTime:CreateDate=#{datetime}",
+        "-QuickTime:MediaCreateDate=#{datetime}",
+        "-QuickTime:TrackCreateDate=#{datetime}",
+        "-FileModifyDate=#{datetime}",
+        "-FileCreateDate=#{datetime}"
+      ]
+    end
+    if gps
+      lat, lon = gps
+      coords = "#{lat}, #{lon}"
+      args += ["-Keys:GPSCoordinates=#{coords}", "-UserData:GPSCoordinates=#{coords}"]
+    end
+    args += ["-Keys:Make=#{make}", "-UserData:Make=#{make}"] if make && !make.empty?
+    args += ["-Keys:Model=#{model}", "-UserData:Model=#{model}"] if model && !model.empty?
+  end
+
+  args.length > 6 ? args : nil
+end
+
+targets = collect_targets(paths, media_exts)
+updates = []
+
+if !global_time.empty? || !global_gps.empty? || !global_make.empty? || !global_model.empty?
+  targets.each do |target|
+    updates << [
+      target,
+      {
+        time: global_time,
+        gps: global_gps,
+        make: global_make,
+        model: global_model
+      }
+    ]
+  end
+end
+
+if !metadata_csv.empty?
+  CSV.foreach(metadata_csv, headers: true) do |row|
+    key = row_value(row, "file", "path", "source", "name")
+    target = resolve_target(key, targets)
+    next unless target
+
+    updates << [
+      target,
+      {
+        time: row_value(row, "time", "datetime", "date_time", "capture_time"),
+        gps: row_value(row, "gps", "coordinates", "latlon", "lat_lon"),
+        lat: row_value(row, "lat", "latitude"),
+        lon: row_value(row, "lon", "lng", "longitude"),
+        make: row_value(row, "make", "camera_make", "device_make"),
+        model: row_value(row, "model", "camera_model", "device_model")
+      }
+    ]
+  end
+end
+
+applied = 0
+updates.each do |target, metadata|
+  args = metadata_args_for(target, metadata, image_exts, video_exts, tz)
+  next unless args
+
+  args << target
+  if dry_run
+    puts "DRY RUN: #{args.shelljoin}"
+  else
+    system(*args, out: File::NULL) || exit($?.exitstatus || 1)
+  end
+  applied += 1
+end
+
+puts "Manual metadata updates: #{applied} file(s)."
+RUBY
+fi
+
+echo "Synchronizing device make/model metadata..."
+if [[ "$dry_run" -eq 1 ]]; then
+  echo "DRY RUN: scan existing Make/Model fields, skip conflicting fields, and write non-conflicting values across supported EXIF/TIFF/XMP/QuickTime fields"
+else
+  ruby - "${paths[@]}" <<'RUBY'
+require "csv"
+require "open3"
+
+paths = ARGV
+image_exts = %w[.jpg .jpeg .heic .png .tif .tiff]
+video_exts = %w[.mp4 .mov .m4v .3gp]
+ext_args = %w[-ext jpg -ext jpeg -ext heic -ext png -ext tif -ext tiff -ext mp4 -ext mov -ext m4v -ext 3gp]
+
+def first_value(row, keys)
+  keys.each do |key|
+    value = row[key]
+    return value.strip if value && !value.strip.empty?
+  end
+  nil
+end
+
+def conflict_warning(file, field, values)
+  message = "CONFLICT: #{field} differs in #{file}; keeping existing values and skipping automatic sync. #{values.map { |key, value| "#{key}=#{value.inspect}" }.join(', ')}"
+  warn "\e[41;97;1m #{message} \e[0m"
+end
+
+def non_conflicting_value(row, file, field, keys)
+  values = keys.map do |key|
+    value = row[key]
+    next if value.nil? || value.strip.empty?
+    [key, value.strip]
+  end.compact
+  unique_values = values.map(&:last).uniq
+  return nil if unique_values.empty?
+  if unique_values.length > 1
+    conflict_warning(file, field, values)
+    return :conflict
+  end
+  unique_values.first
+end
+
+cmd = [
+  "exiftool",
+  "-r",
+  "-G1",
+  "-csv",
+  *ext_args,
+  "-IFD0:Make",
+  "-IFD0:Model",
+  "-XMP-tiff:Make",
+  "-XMP-tiff:Model",
+  "-Keys:Make",
+  "-Keys:Model",
+  "-UserData:Make",
+  "-UserData:Model",
+  *paths
+]
+
+stdout, stderr, status = Open3.capture3(*cmd)
+unless status.success?
+  warn stderr
+  exit status.exitstatus || 1
+end
+
+updated = 0
+CSV.parse(stdout, headers: true).each do |row|
+  source = row["SourceFile"]
+  next unless source && File.file?(source)
+
+  ext = File.extname(source).downcase
+  args = ["exiftool", "-P", "-overwrite_original", "-m"]
+
+  if image_exts.include?(ext)
+    make = non_conflicting_value(row, source, "Make", ["IFD0:Make", "XMP-tiff:Make"])
+    model = non_conflicting_value(row, source, "Model", ["IFD0:Model", "XMP-tiff:Model"])
+    args += ["-IFD0:Make=#{make}", "-XMP-tiff:Make=#{make}"] if make && make != :conflict
+    args += ["-IFD0:Model=#{model}", "-XMP-tiff:Model=#{model}"] if model && model != :conflict
+  elsif video_exts.include?(ext)
+    make = non_conflicting_value(row, source, "Make", ["Keys:Make", "UserData:Make"])
+    model = non_conflicting_value(row, source, "Model", ["Keys:Model", "UserData:Model"])
+    args += ["-Keys:Make=#{make}", "-UserData:Make=#{make}"] if make && make != :conflict
+    args += ["-Keys:Model=#{model}", "-UserData:Model=#{model}"] if model && model != :conflict
+  end
+
+  next if args.length == 4
+
+  args << source
+  system(*args, out: File::NULL) || exit($?.exitstatus || 1)
+  updated += 1
+end
+
+puts "Synchronized device make/model metadata for #{updated} file(s)."
+RUBY
+fi
+
+if [[ -z "$gps" && -z "$metadata_csv" ]]; then
+  echo "Synchronizing GPS metadata where non-conflicting..."
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo "DRY RUN: scan existing GPS fields, skip conflicts, and write missing non-conflicting GPS counterparts"
+  else
+    ruby - "${paths[@]}" <<'RUBY'
+require "csv"
+require "open3"
+
+paths = ARGV
+image_exts = %w[.jpg .jpeg .heic .png .tif .tiff]
+video_exts = %w[.mp4 .mov .m4v .3gp]
+ext_args = %w[-ext jpg -ext jpeg -ext heic -ext png -ext tif -ext tiff -ext mp4 -ext mov -ext m4v -ext 3gp]
+
+def present?(value)
+  value && !value.strip.empty?
+end
+
+def number(value)
+  Float(value) if present?(value)
+rescue ArgumentError
+  nil
+end
+
+def close?(a, b)
+  a && b && (a - b).abs < 0.000001
+end
+
+def conflict_warning(file, field, values)
+  message = "CONFLICT: #{field} differs in #{file}; keeping existing values and skipping automatic sync. #{values.map { |key, value| "#{key}=#{value.inspect}" }.join(', ')}"
+  warn "\e[41;97;1m #{message} \e[0m"
+end
+
+def parse_coordinate_pair(value)
+  return nil unless present?(value)
+  text = value.strip
+  numeric_parts = text.scan(/[-+]?\d+(?:\.\d+)?/)
+  return nil unless numeric_parts.length >= 2
+
+  lat = number(numeric_parts[0])
+  lon = number(numeric_parts[1])
+  return nil unless lat && lon
+
+  lat = -lat.abs if text =~ /\bS\b/i
+  lon = -lon.abs if text =~ /\bW\b/i
+  lat = lat.abs if text =~ /\bN\b/i
+  lon = lon.abs if text =~ /\bE\b/i
+  [lat, lon]
+end
+
+cmd = [
+  "exiftool",
+  "-r",
+  "-n",
+  "-G1",
+  "-csv",
+  *ext_args,
+  "-GPS:GPSLatitude",
+  "-GPS:GPSLongitude",
+  "-XMP-exif:GPSLatitude",
+  "-XMP-exif:GPSLongitude",
+  "-Keys:GPSCoordinates#",
+  "-UserData:GPSCoordinates#",
+  *paths
+]
+
+stdout, stderr, status = Open3.capture3(*cmd)
+unless status.success?
+  warn stderr
+  exit status.exitstatus || 1
+end
+
+updated = 0
+CSV.parse(stdout, headers: true).each do |row|
+  source = row["SourceFile"]
+  next unless source && File.file?(source)
+
+  ext = File.extname(source).downcase
+  args = ["exiftool", "-P", "-overwrite_original", "-m"]
+
+  if image_exts.include?(ext)
+    exif_lat = number(row["GPS:GPSLatitude"])
+    exif_lon = number(row["GPS:GPSLongitude"])
+    xmp_lat = number(row["XMP-exif:GPSLatitude"])
+    xmp_lon = number(row["XMP-exif:GPSLongitude"])
+    has_exif = exif_lat && exif_lon
+    has_xmp = xmp_lat && xmp_lon
+
+    if has_exif && has_xmp && (!close?(exif_lat, xmp_lat) || !close?(exif_lon, xmp_lon))
+      conflict_warning(source, "GPS", {
+        "GPS:GPSLatitude" => row["GPS:GPSLatitude"],
+        "GPS:GPSLongitude" => row["GPS:GPSLongitude"],
+        "XMP-exif:GPSLatitude" => row["XMP-exif:GPSLatitude"],
+        "XMP-exif:GPSLongitude" => row["XMP-exif:GPSLongitude"]
+      })
+      next
+    elsif has_exif && !has_xmp
+      args += ["-XMP-exif:GPSLatitude=#{exif_lat}", "-XMP-exif:GPSLongitude=#{exif_lon}"]
+    elsif has_xmp && !has_exif
+      args += [
+        "-GPSLatitude=#{xmp_lat}",
+        "-GPSLongitude=#{xmp_lon}",
+        "-GPSLatitudeRef=#{xmp_lat.negative? ? "S" : "N"}",
+        "-GPSLongitudeRef=#{xmp_lon.negative? ? "W" : "E"}"
+      ]
+    end
+  elsif video_exts.include?(ext)
+    keys = row["Keys:GPSCoordinates#"] || row["Keys:GPSCoordinates"]
+    user_data = row["UserData:GPSCoordinates#"] || row["UserData:GPSCoordinates"]
+    keys_coords = parse_coordinate_pair(keys)
+    user_data_coords = parse_coordinate_pair(user_data)
+    if keys_coords && user_data_coords
+      keys_lat, keys_lon = keys_coords
+      user_lat, user_lon = user_data_coords
+      unless close?(keys_lat, user_lat) && close?(keys_lon, user_lon)
+        conflict_warning(source, "GPSCoordinates", {
+          "Keys:GPSCoordinates" => keys,
+          "UserData:GPSCoordinates" => user_data
+        })
+        next
+      end
+    elsif keys_coords && !user_data_coords
+      args += ["-UserData:GPSCoordinates=#{keys_coords.join(', ')}"]
+    elsif user_data_coords && !keys_coords
+      args += ["-Keys:GPSCoordinates=#{user_data_coords.join(', ')}"]
+    end
+  end
+
+  next if args.length == 4
+  args << source
+  system(*args, out: File::NULL) || exit($?.exitstatus || 1)
+  updated += 1
+end
+
+puts "Synchronized GPS metadata for #{updated} file(s); conflicting GPS values were preserved."
+RUBY
+  fi
+fi
+
+if has_image_targets; then
+  echo "Filling missing image capture time from fallback metadata..."
+  run_optional_match exiftool -r -P -overwrite_original -m \
+    "${image_exts[@]}" \
+    -if 'not $DateTimeOriginal and $CreateDate' \
+    "-DateTimeOriginal<CreateDate" \
+    "${paths[@]}"
+
+  run_optional_match exiftool -r -P -overwrite_original -m \
+    "${image_exts[@]}" \
+    -if 'not $DateTimeOriginal and $ModifyDate' \
+    "-DateTimeOriginal<ModifyDate" \
+    "${paths[@]}"
+
+  run_optional_match exiftool -r -P -overwrite_original -m \
+    "${image_exts[@]}" \
+    -if 'not $DateTimeOriginal and $FileCreateDate' \
+    "-DateTimeOriginal<FileCreateDate" \
+    "${paths[@]}"
+
+  run_optional_match exiftool -r -P -overwrite_original -m \
+    "${image_exts[@]}" \
+    -if 'not $DateTimeOriginal and $FileModifyDate' \
+    "-DateTimeOriginal<FileModifyDate" \
+    "${paths[@]}"
+
+  echo "Repairing image metadata..."
+  run exiftool -r -P -overwrite_original -m -api QuickTimeUTC=1 \
+    "${image_exts[@]}" \
+    "-DateTimeOriginal<DateTimeOriginal" \
+    "-CreateDate<DateTimeOriginal" \
+    "-ModifyDate<DateTimeOriginal" \
+    "-XMP:DateCreated<DateTimeOriginal" \
+    "-XMP:CreateDate<DateTimeOriginal" \
+    "-XMP-photoshop:DateCreated<DateTimeOriginal" \
+    "-IPTC:DateCreated<DateTimeOriginal" \
+    "-IPTC:TimeCreated<DateTimeOriginal" \
+    "-OffsetTime=$tz" \
+    "-OffsetTimeOriginal=$tz" \
+    "-OffsetTimeDigitized=$tz" \
+    "-FileModifyDate<DateTimeOriginal" \
+    "-FileCreateDate<DateTimeOriginal" \
+    "${image_gps_args[@]}" \
+    "${paths[@]}"
+fi
+
+if has_video_targets; then
+  echo "Filling missing video creation time from fallback metadata..."
+  run_optional_match exiftool -r -P -overwrite_original -m -api QuickTimeUTC=1 \
+    "${video_exts[@]}" \
+    -if 'not $QuickTime:CreateDate and $QuickTime:MediaCreateDate' \
+    "-QuickTime:CreateDate<QuickTime:MediaCreateDate" \
+    "${paths[@]}"
+
+  run_optional_match exiftool -r -P -overwrite_original -m -api QuickTimeUTC=1 \
+    "${video_exts[@]}" \
+    -if 'not $QuickTime:CreateDate and $QuickTime:TrackCreateDate' \
+    "-QuickTime:CreateDate<QuickTime:TrackCreateDate" \
+    "${paths[@]}"
+
+  run_optional_match exiftool -r -P -overwrite_original -m -api QuickTimeUTC=1 \
+    "${video_exts[@]}" \
+    -if 'not $QuickTime:CreateDate and $FileCreateDate' \
+    -d '%Y:%m:%d %H:%M:%S' \
+    "-QuickTime:CreateDate<FileCreateDate" \
+    "${paths[@]}"
+
+  run_optional_match exiftool -r -P -overwrite_original -m -api QuickTimeUTC=1 \
+    "${video_exts[@]}" \
+    -if 'not $QuickTime:CreateDate and $FileModifyDate' \
+    -d '%Y:%m:%d %H:%M:%S' \
+    "-QuickTime:CreateDate<FileModifyDate" \
+    "${paths[@]}"
+
+  echo "Repairing video metadata from QuickTime CreateDate..."
+  run_optional_match exiftool -r -P -overwrite_original -m -api QuickTimeUTC=1 \
+    "${video_exts[@]}" \
+    -if '$QuickTime:CreateDate and $QuickTime:CreateDate ne "0000:00:00 00:00:00"' \
+    "-FileModifyDate<\${QuickTime:CreateDate}" \
+    "-FileCreateDate<\${QuickTime:CreateDate}" \
+    "-QuickTime:MediaCreateDate<\${QuickTime:CreateDate}" \
+    "-QuickTime:TrackCreateDate<\${QuickTime:CreateDate}" \
+    "${paths[@]}"
+fi
+
+if [[ -n "$gps" ]] && has_video_targets; then
+  echo "Writing explicit video GPS metadata..."
+  run exiftool -r -P -overwrite_original -m \
+    "${video_exts[@]}" \
+    "${video_gps_args[@]}" \
+    "${paths[@]}"
+fi
+
+if [[ "$verify_sample" -gt 0 ]]; then
+  echo "Verification sample:"
+  find "${paths[@]}" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' -o -iname '*.png' -o -iname '*.tif' -o -iname '*.tiff' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.3gp' \) \
+    | ruby -e "puts STDIN.read.lines.sample($verify_sample)" \
+    | while IFS= read -r file; do
+        echo "==== $file"
+        exiftool -s -DateTimeOriginal -CreateDate -ModifyDate -OffsetTimeOriginal -GPSLatitude -GPSLongitude -Make -Model -QuickTime:CreateDate -QuickTime:MediaCreateDate -QuickTime:TrackCreateDate -FileModifyDate "$file"
+      done
+fi
+
+if [[ "$convert_jpg_to_jxl" -eq 1 ]]; then
+  echo "Converting JPEG files to lossless JPEG XL..."
+  ruby - "$dry_run" "$overwrite_jxl" "$replace_jpg_with_jxl" "${paths[@]}" <<'RUBY'
+require "find"
+require "fileutils"
+require "open3"
+require "shellwords"
+
+dry_run, overwrite_jxl, replace_jpg_with_jxl, *paths = ARGV
+dry_run = dry_run == "1"
+overwrite_jxl = overwrite_jxl == "1"
+replace_jpg_with_jxl = replace_jpg_with_jxl == "1"
+
+def jpeg_file?(path)
+  File.file?(path) && [".jpg", ".jpeg"].include?(File.extname(path).downcase)
+end
+
+def output_path_for(path)
+  File.join(File.dirname(path), "#{File.basename(path, File.extname(path))}.jxl")
+end
+
+inputs = []
+paths.each do |path|
+  expanded = File.expand_path(path)
+  if File.directory?(path)
+    Find.find(expanded) do |item|
+      next unless jpeg_file?(item)
+      inputs << item
+    end
+  elsif jpeg_file?(path)
+    inputs << expanded
+  end
+end
+
+converted = 0
+skipped = 0
+failed = 0
+replaced = 0
+
+inputs.sort.each do |input|
+  output = output_path_for(input)
+  if File.exist?(output) && !overwrite_jxl
+    puts "Skipping existing #{output}"
+    skipped += 1
+    next
+  end
+
+  cmd = ["cjxl", input, output, "--lossless_jpeg=1", "--container=1", "--quiet"]
+  if dry_run
+    puts "DRY RUN: #{cmd.shelljoin}"
+    puts "DRY RUN: rm #{input.shellescape}" if replace_jpg_with_jxl
+    converted += 1
+    next
+  end
+
+  FileUtils.mkdir_p(File.dirname(output))
+
+  unless system(*cmd)
+    warn "Failed to convert #{input}"
+    failed += 1
+    next
+  end
+
+  stat = File.stat(input)
+  File.utime(stat.atime, stat.mtime, output)
+  if replace_jpg_with_jxl
+    FileUtils.rm_f(input)
+    replaced += 1
+  end
+  converted += 1
+end
+
+puts "JPEG XL conversion summary: #{converted} converted, #{replaced} JPEG files removed, #{skipped} skipped, #{failed} failed."
+exit 1 if failed.positive?
+RUBY
+fi
