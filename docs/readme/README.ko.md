@@ -66,7 +66,7 @@ Windows에서는 WSL, Git Bash, MSYS2 같은 Bash 환경에서 실행하고 해�
 ## 주요 옵션
 
 ```text
---tz +08:00                 시간대 오프셋 쓰기
+--tz +08:00                 시간대 오프셋 쓰기; 파일명 복구 시 필수
 --gps LAT,LON               GPS 좌표 쓰기
 --set-time DATETIME         모든 입력에 촬영 시간 설정
 --set-gps LAT,LON           모든 입력에 GPS 설정
@@ -119,4 +119,3 @@ GPS는 EXIF GPS와 XMP-exif GPS에 기록됩니다. 제조사/모델은 이미�
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

@@ -66,7 +66,7 @@ Rellenar la hora desde el nombre del archivo cuando falta:
 ## Opciones comunes
 
 ```text
---tz +08:00                 Escribir la zona horaria
+--tz +08:00                 Escribir la zona horaria; obligatorio al recuperar desde nombres de archivo
 --gps LAT,LON               Escribir coordenadas GPS
 --set-time DATETIME         Definir hora de captura para todos los archivos
 --set-gps LAT,LON           Definir GPS para todos los archivos
@@ -119,4 +119,3 @@ Si hay conflicto en un campo que no es de tiempo, la herramienta conserva los va
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

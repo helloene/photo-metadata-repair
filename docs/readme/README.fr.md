@@ -66,7 +66,7 @@ Récupérer l'heure depuis les noms de fichiers quand elle manque :
 ## Options courantes
 
 ```text
---tz +08:00                 Écrire le décalage horaire
+--tz +08:00                 Écrire le décalage horaire ; requis pour récupérer l’heure depuis le nom de fichier
 --gps LAT,LON               Écrire les coordonnées GPS
 --set-time DATETIME         Définir l'heure de capture pour tous les fichiers
 --set-gps LAT,LON           Définir le GPS pour tous les fichiers
@@ -119,4 +119,3 @@ En cas de conflit sur un champ non temporel, l'outil conserve les valeurs exista
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

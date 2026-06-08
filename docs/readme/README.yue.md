@@ -66,7 +66,7 @@ Windows 建議用 WSL、Git Bash 或 MSYS2 跑，並喺嗰個環境安裝依賴�
 ## 常用選項
 
 ```text
---tz +08:00                 寫入時區偏移
+--tz +08:00                 寫入時區偏移；從檔名恢復時間時必填
 --gps LAT,LON               寫入 GPS
 --set-time DATETIME         幫所有輸入設定拍攝時間
 --set-gps LAT,LON           幫所有輸入設定 GPS
@@ -117,4 +117,3 @@ FileModifyDate
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

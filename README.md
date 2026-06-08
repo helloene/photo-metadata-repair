@@ -137,7 +137,7 @@ Usage:
   media-metadata-repair [options] <folder-or-file>...
 
 Options:
-  --tz +08:00                 Timezone offset to write into EXIF/XMP offset tags.
+  --tz +08:00                 Timezone offset to write into EXIF/XMP offset tags. Required for filename recovery.
   --gps LAT,LON               Write GPS coordinates to EXIF and XMP GPS fields.
   --set-time DATETIME         Set capture time for all inputs, then sync supported time fields.
   --set-gps LAT,LON           Set GPS coordinates for all inputs.
@@ -349,6 +349,8 @@ The script uses `cjxl --lossless_jpeg=1`, which losslessly transcodes JPEG files
 /path/to/photos/IMG_0001.jpg -> ./media-metadata-repair-output-YYYYMMDD-HHMMSS/photos/IMG_0001.jxl
 ```
 
+After a successful conversion, the `.jxl` file's filesystem create and modify dates are synchronized from the repaired JPEG.
+
 By default, repaired files go under a new `./media-metadata-repair-output-YYYYMMDD-HHMMSS` directory from the current working directory, preserving the input directory structure. Original input files are kept unchanged. Existing `.jxl` files in the repaired output are skipped.
 
 Choose another repaired-output directory:
@@ -409,6 +411,8 @@ Filename timestamp preflight:
   sample: IMG_20190811105900.jpg -> 2019:08:11 10:59:00
 - YYYYMMDD_HHMMSS (8-digit date plus 6-digit time): 12 file(s)
   sample: VID_20190811_110322.mp4 -> 2019:08:11 11:03:22
+- Unix Time (milliseconds) (13-digit Unix time in milliseconds): 6 file(s)
+  sample: download_1581822285796.jpg -> 2020:02:16 11:04:45
 ```
 
 Type `yes` to continue. Use `--dry-run` to preview without writing, or `--yes` for a non-interactive run after you have already verified the naming rules.
@@ -419,7 +423,11 @@ Supported filename timestamp rules are intentionally conservative:
 YYYYMMDDHHMMSS
 YYYYMMDD_HHMMSS
 YYYY-MM-DD_HH-MM-SS
+Unix Time (seconds)
+Unix Time (milliseconds)
 ```
+
+Unix Time matching is prefix-independent: any standalone 10-digit or 13-digit number in the filename can match if it converts to a valid date in the configured timezone.
 
 Examples that work:
 
@@ -427,6 +435,8 @@ Examples that work:
 20190811105900.jpg -> 2019:08:11 10:59:00
 IMG_20190811_105900.heic -> 2019:08:11 10:59:00
 Screenshot 2019-08-11 10.59.00.png -> 2019:08:11 10:59:00
+download_1581822285796.jpg -> 2020:02:16 11:04:45
+1581822285.jpg -> 2020:02:16 11:04:45
 ```
 
 Ambiguous or date-only names such as `09May26.jpg` are not written automatically. They need a manual rule because the filename alone does not prove whether it means `2009-05-26`, `2026-05-09`, or another convention.
@@ -439,7 +449,7 @@ This tool reduces that ambiguity by making the common time fields agree:
 
 - EXIF capture time for images
 - QuickTime creation time for videos
-- `+08:00` or another explicit timezone offset when requested
+- existing EXIF/XMP timezone offsets when present, or an explicit `--tz` when requested
 - Finder file dates aligned with the embedded capture time
 
 ## EXIF, TIFF, and JFIF

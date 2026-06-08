@@ -66,7 +66,7 @@ Recuperare l'ora dal nome file quando manca:
 ## Opzioni comuni
 
 ```text
---tz +08:00                 Scrive il fuso orario
+--tz +08:00                 Scrive il fuso orario; richiesto per recuperare dai nomi file
 --gps LAT,LON               Scrive le coordinate GPS
 --set-time DATETIME         Imposta l'ora di acquisizione per tutti i file
 --set-gps LAT,LON           Imposta il GPS per tutti i file
@@ -119,4 +119,3 @@ Se un campo non temporale è in conflitto, lo strumento conserva i valori esiste
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

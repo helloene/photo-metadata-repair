@@ -66,7 +66,7 @@ Lấy thời gian từ tên tệp khi metadata thời gian bị thiếu:
 ## Tùy chọn thường dùng
 
 ```text
---tz +08:00                 Ghi độ lệch múi giờ
+--tz +08:00                 Ghi độ lệch múi giờ; bắt buộc khi khôi phục từ tên tệp
 --gps LAT,LON               Ghi tọa độ GPS
 --set-time DATETIME         Đặt thời gian chụp cho mọi đầu vào
 --set-gps LAT,LON           Đặt GPS cho mọi đầu vào
@@ -119,4 +119,3 @@ Nếu trường không phải thời gian có xung đột, công cụ giữ giá
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

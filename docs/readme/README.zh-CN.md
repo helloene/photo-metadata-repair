@@ -66,7 +66,7 @@ Windows 用户建议在 WSL、Git Bash 或 MSYS2 中运行，并在该环境里�
 ## 常用选项
 
 ```text
---tz +08:00                 写入时区偏移
+--tz +08:00                 写入时区偏移；从文件名恢复时间时必填
 --gps LAT,LON               写入 GPS 坐标
 --set-time DATETIME         为所有输入设置拍摄时间
 --set-gps LAT,LON           为所有输入设置 GPS
@@ -126,4 +126,3 @@ GPS 会写入 EXIF GPS 与 XMP-exif GPS 字段。设备品牌/型号会在图片
 ```bash
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

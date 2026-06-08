@@ -66,7 +66,7 @@ sudo dnf install perl-Image-ExifTool jpegxl-tools
 ## ตัวเลือกที่ใช้บ่อย
 
 ```text
---tz +08:00                 เขียนค่าเขตเวลา
+--tz +08:00                 เขียนค่าเขตเวลา ต้องระบุเมื่อกู้เวลาจากชื่อไฟล์
 --gps LAT,LON               เขียนพิกัด GPS
 --set-time DATETIME         ตั้งเวลาถ่ายให้ทุกไฟล์
 --set-gps LAT,LON           ตั้ง GPS ให้ทุกไฟล์
@@ -119,4 +119,3 @@ GPS จะเขียนลง EXIF GPS และ XMP-exif GPS ส่วนย�
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

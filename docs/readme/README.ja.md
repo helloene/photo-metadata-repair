@@ -66,7 +66,7 @@ Windows では WSL、Git Bash、MSYS2 などの Bash 環境で実行し、その
 ## 主なオプション
 
 ```text
---tz +08:00                 タイムゾーンオフセットを書き込む
+--tz +08:00                 タイムゾーンオフセットを書き込む。ファイル名から復元する場合は必須
 --gps LAT,LON               GPS 座標を書き込む
 --set-time DATETIME         すべての入力に撮影日時を設定
 --set-gps LAT,LON           すべての入力に GPS を設定
@@ -119,4 +119,3 @@ GPS は EXIF GPS と XMP-exif GPS に書き込まれます。メーカー/モデ
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-

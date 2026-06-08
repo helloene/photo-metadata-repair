@@ -66,7 +66,7 @@ Ontbrekende opnametijd uit bestandsnamen halen:
 ## Veelgebruikte opties
 
 ```text
---tz +08:00                 Tijdzone-offset schrijven
+--tz +08:00                 Tijdzone-offset schrijven; vereist voor herstel vanuit bestandsnamen
 --gps LAT,LON               GPS-coordinaten schrijven
 --set-time DATETIME         Opnametijd instellen voor alle input
 --set-gps LAT,LON           GPS instellen voor alle input
@@ -119,4 +119,3 @@ Bij conflicten in niet-tijdvelden behoudt de tool bestaande waarden, slaat autom
 ./media-metadata-repair --tz +08:00 --verify-sample 20 /path/to/photos
 exiftool -a -G1 -s -time:all '-OffsetTime*' -GPS:All /path/to/file
 ```
-
